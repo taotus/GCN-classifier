@@ -1,0 +1,230 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import random
+import torch.nn.functional as F
+from torch_geometric import seed_everything
+
+
+def set_seed(seed=42):
+    """设置所有随机种子以确保结果可复现"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    seed_everything(seed)  # PyG的特殊设置
+
+
+class MPNN(nn.Module):
+    def __init__(self, node_dim, edge_dim, hidden_dim=128):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(2*node_dim+edge_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        self.information = nn.Sequential(
+            nn.Linear(2*node_dim+edge_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, node_dim),
+            nn.LayerNorm(node_dim)
+        )
+
+        self.update_w = nn.Linear(node_dim, node_dim)
+        self.layer_norm = nn.LayerNorm(node_dim)
+
+
+    def message(self, h_u, h_v, edge_feature):
+
+        message = torch.cat([h_u, h_v, edge_feature], dim=-1)
+
+        return message
+
+    def aggregate(self, H, u, v, messages, norm_factors=None):
+        attn = self.attention(messages)
+        info = self.information(messages)
+
+        if norm_factors is not None:
+            filtered_messages = attn * info * norm_factors.unsqueeze(-1)
+        else:
+            filtered_messages = attn * info
+
+        aggregated = H.index_add(0, v, filtered_messages).index_add(0, u, filtered_messages)
+
+        return aggregated
+
+    def update(self, H_aggregated):
+        output = self.update_w(H_aggregated)
+        return output
+
+    def forward(self, H, edge_index, edge_feature, norm_factor=None):
+
+        u, v = edge_index[0], edge_index[1]
+
+        h_u = H[u]
+        h_v = H[v]
+
+        messages = self.message(h_u, h_v, edge_feature)
+
+        H_aggregated = self.aggregate(H, u, v, messages, norm_factor)
+
+        H_updated = self.update(H_aggregated)
+
+        return H_updated
+
+class GCN(nn.Module):
+    def __init__(self, edge_dim, hidden_dim, output_dim=1, num_layer=3, dropout=0.3):
+        super(GCN, self).__init__()
+
+        self.num_layer = num_layer
+
+        self.node_encoder = nn.Embedding(118, hidden_dim, dtype=torch.float32)
+
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim)
+        )
+
+        self.target_encoder = nn.Embedding(4, hidden_dim, dtype=torch.float32)
+
+        # 特征变换层
+        self.feature_transform = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim)
+        )
+
+        # 门控融合层
+        self.global_gates = nn.ModuleList()
+        for _ in range(num_layer):
+            self.global_gates.append(nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.Sigmoid()
+            ))
+
+        self.gcn_layers = nn.ModuleList()
+        for _ in range(num_layer):
+            self.gcn_layers.append(
+                MPNN(hidden_dim, hidden_dim, hidden_dim // 2)
+            )
+
+        self.dropout_layer = nn.Dropout(dropout)
+
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
+
+    def readout_function(self, H):
+        return torch.mean(H, dim=0, keepdim=True)
+
+    def forward(self, atom_type, edge_index, edge_features, global_feature, batch=None):
+
+        H = self.feature_transform(self.node_encoder(atom_type).squeeze(1)) #对节点进行嵌入处理
+        E = self.edge_encoder(edge_features) #对边特征进行处理
+        T = self.feature_transform(self.target_encoder(global_feature)) #以靶点作为全局特征进行处理
+
+        norm_factors = self.calc_norm_factor(edge_index, H.size(0))
+
+        for i, mpnn in enumerate(self.gcn_layers):
+            H += mpnn(H, edge_index, E, norm_factors)
+
+            # 门控融合全局特征
+            if batch is not None:
+                gate = self.global_gates[i](torch.cat([H, T[batch]], dim=-1))
+                H = gate * H + (1 - gate) * T[batch]
+            else:
+                gate = self.global_gates[i](torch.cat([H, T.expand_as(H)], dim=-1))
+                H = gate * H + (1 - gate) * T.expand_as(H)
+
+            if i < self.num_layer -1:
+                H = self.dropout_layer(H)
+
+        if batch is not None:
+            batch_size = batch.max().item() + 1
+            graph_embeddings = []
+
+            for i in range(batch_size):
+                mask = (batch == i)
+                graph_output = self.readout_function(H[mask])
+                graph_embeddings.append(graph_output)
+
+            graph_embedding = torch.cat(graph_embeddings, dim=0)
+
+        else:
+            graph_embedding = self.readout_function(H)
+
+        output = self.output_layer(graph_embedding)
+
+        return output
+
+    def calc_norm_factor(self, edge_index, num_nodes, self_loop=True):
+        device = edge_index.device
+        """
+        num, _ = adj_matrix.shape
+        if self_loop:
+            adj_matrix = adj_matrix + torch.eye(num, device=device)
+        """
+
+        row, col = edge_index[0], edge_index[1]
+
+        deg = torch.zeros(num_nodes, dtype=torch.float, device=device)
+
+        deg = deg.scatter_add(0, row, torch.ones(row.size(), dtype=torch.float,
+                                                 device=device))
+
+        if self_loop:
+            deg = deg + 1.0
+
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+
+        norm_factors = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+
+        return norm_factors
+
+if __name__ == "__main__":
+    device = 'cuda:0'
+    set_seed()
+    from MoleculeGraph import smiles_to_graph, graph_to_PyGData
+    from torch_geometric.loader import DataLoader
+    smiles = ["C", "CC", "CCCC"]
+    dataset = []
+    for smile in smiles:
+        graph = smiles_to_graph(smile, target="seh")
+        data = graph_to_PyGData(graph, target='seh', label=1)
+        dataset.append(data)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=3,
+        pin_memory=True
+    )
+
+    for data in dataloader:
+        data = data.to(device)
+        batch = data.batch
+        print(batch)
+        node_dim = data.x.shape[1]
+        E = data.edge_attr
+        edge_dim = E.shape[1]
+        net = GCN(
+            edge_dim=edge_dim,
+            hidden_dim=8,
+            output_dim=2,
+            num_layer=3,
+            dropout=0.5
+        ).to(device)
+        print(net)
+
+        print(f"\n前向传播 (节点分类):")
+        node_outputs = net(data.x, data.edge_index, E, data.global_features, batch)
+        print(f"节点输出形状: {node_outputs.shape}")
+
+        break

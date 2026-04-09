@@ -1,0 +1,12 @@
+.idea/
+data/
+PDB/
+sampled_data/
+train_dataset/
+train_dataset_chunks/
+val_dataset/
+temp/
+*.png
+*.pth
+*.pt
+*.csv
